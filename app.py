@@ -315,9 +315,12 @@ def init_earth_engine():
 
         ee.Initialize(credentials, project=project)
 
+        st.session_state["_gee_initialized"] = True
+
         return True
 
     except Exception as e:
+        st.session_state["_gee_initialized"] = True
         st.session_state["_gee_init_error"] = str(e)
         return False
 
@@ -371,7 +374,8 @@ def fetch_impervious_fraction_gee_batch(_cache_key, lat_lon_pairs):
 
         fractions = [float(min(max((v + 1) / 2, 0.05), 0.98)) for v in values]
         return fractions, True
-    except Exception:
+    except Exception as e:
+        st.error(f"GEE Sampling Error:\n{e}")
         return None, False
 
 
