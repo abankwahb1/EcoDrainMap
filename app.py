@@ -592,12 +592,18 @@ use_real_elevation = st.sidebar.checkbox(
 )
 
 gee_status = init_earth_engine()
+
 if not GEE_AVAILABLE:
     st.sidebar.caption("🌍 Earth Engine: `earthengine-api` not installed.")
+
 elif gee_status:
-    st.sidebar.caption("🌍 Earth Engine: ✅ configured")
+    st.sidebar.success("🌍 Earth Engine: ✅ Configured")
+
 else:
-    st.sidebar.caption("🌍 Earth Engine: ⚠️ not configured (see script header for setup steps)")
+    st.sidebar.error("🌍 Earth Engine: ❌ Not Configured")
+
+    if "_gee_init_error" in st.session_state:
+        st.sidebar.code(st.session_state["_gee_init_error"])
 
 use_real_impervious = st.sidebar.checkbox(
     "Use real impervious surface (Sentinel-2 via Earth Engine)", value=False,
