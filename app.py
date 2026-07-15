@@ -108,6 +108,12 @@ FALLBACK_DRAINS = [(5.608, -0.235), (5.602, -0.231), (5.611, -0.229)]
 # DATA SOURCE 1: DRAINAGE (OpenStreetMap / Overpass)
 # ----------------------------------------------------------------------------
 
+FALLBACK_DRAINS = [(5.608, -0.235), (5.602, -0.231), (5.611, -0.229)]
+
+
+# Define your fallback constants at the module level if not already present
+
+
 @st.cache_data(ttl=3600)
 def fetch_real_osm_drainage_data(lat_min, lat_max, lon_min, lon_max):
     overpass_url = "https://overpass-api.de/api/interpreter"
@@ -123,18 +129,30 @@ def fetch_real_osm_drainage_data(lat_min, lat_max, lon_min, lon_max):
     >;
     out skel qt;
     """
+    
+    # FIX 1: Add mandatory authentication identification headers
+    custom_headers = {
+        'User-Agent': 'EcoDrainMapGhanaFinalYearProject/1.0 (student.project@university.edu.gh)',
+        'Accept-Encoding': 'gzip, deflate'
+    }
+    
     try:
-        response = requests.post(overpass_url, data={"data": query}, timeout=15)
+        # FIX 2: Inject the custom_headers into the POST request configuration
+        response = requests.post(overpass_url, data={"data": query}, headers=custom_headers, timeout=15)
         response.raise_for_status()
+        
         data = response.json()
         drain_coords = [
             (el["lat"], el["lon"]) for el in data.get("elements", []) if "lat" in el and "lon" in el
         ]
+        
         if not drain_coords:
             return FALLBACK_DRAINS, False
+            
         return drain_coords, True
     except Exception:
         return FALLBACK_DRAINS, False
+
 
 
 @st.cache_data(ttl=86400)

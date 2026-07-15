@@ -189,18 +189,71 @@ def train_flood_risk_model(training_df, n_estimators=250, max_depth=10, random_s
     return model, metrics, importances
 
 
-def predict_risk(model, elevation, slope, impervious_fraction, dist_to_drain, rain_mm, soil_sat):
+def predict_risk(model, elevation, slope, impervious_fraction,
+                 dist_to_drain, rain_mm, soil_sat):
     """
-    Predicts flood risk for one or more points. All arguments accept either
-    scalars or array-likes of equal length.
+    Predict flood risk for one or more locations.
+
+    Parameters may be either:
+    - Scalars (single value)
+    - Lists
+    - NumPy arrays
+    - Pandas Series
+
+    If rainfall or soil saturation is supplied as a scalar, it is
+    automatically expanded to match the number of terrain samples.
     """
+
+    # Convert all terrain inputs to arrays
+    elevation = np.asarray(np.atleast_1d(elevation))
+    slope = np.asarray(np.atleast_1d(slope))
+    impervious_fraction = np.asarray(np.atleast_1d(impervious_fraction))
+    dist_to_drain = np.asarray(np.atleast_1d(dist_to_drain))
+
+    # Determine number of prediction points
+    n = len(elevation)
+
+    # Expand scalar rainfall and soil saturation
+    if np.isscalar(rain_mm):
+        rain_mm = np.full(n, rain_mm)
+    else:
+        rain_mm = np.asarray(np.atleast_1d(rain_mm))
+
+    if np.isscalar(soil_sat):
+        soil_sat = np.full(n, soil_sat)
+    else:
+        soil_sat = np.asarray(np.atleast_1d(soil_sat))
+
+    # Verify all feature arrays have identical lengths
+    lengths = [
+        len(elevation),
+        len(slope),
+        len(impervious_fraction),
+        len(dist_to_drain),
+        len(rain_mm),
+        len(soil_sat),
+    ]
+
+    if len(set(lengths)) != 1:
+        raise ValueError(
+            f"Feature length mismatch: "
+            f"elevation={len(elevation)}, "
+            f"slope={len(slope)}, "
+            f"impervious_fraction={len(impervious_fraction)}, "
+            f"dist_to_drain={len(dist_to_drain)}, "
+            f"rain_mm={len(rain_mm)}, "
+            f"soil_sat={len(soil_sat)}"
+        )
+
     X = pd.DataFrame({
-        "elevation": np.atleast_1d(elevation),
-        "slope": np.atleast_1d(slope),
-        "impervious_fraction": np.atleast_1d(impervious_fraction),
-        "dist_to_drain": np.atleast_1d(dist_to_drain),
-        "rain_mm": np.atleast_1d(rain_mm),
-        "soil_sat": np.atleast_1d(soil_sat),
+        "elevation": elevation,
+        "slope": slope,
+        "impervious_fraction": impervious_fraction,
+        "dist_to_drain": dist_to_drain,
+        "rain_mm": rain_mm,
+        "soil_sat": soil_sat,
     })
+
     preds = model.predict(X)
+
     return np.clip(preds, 0.02, 0.97)
