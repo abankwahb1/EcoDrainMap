@@ -60,6 +60,8 @@ import io
 import os
 import time
 from datetime import datetime
+import json
+import tempfile
 
 import folium
 import numpy as np
@@ -76,9 +78,9 @@ try:
 except ImportError:
     GEE_AVAILABLE = False
 
-# ----------------------------------------------------------------------------
+
 # CONFIG
-# ----------------------------------------------------------------------------
+
 st.set_page_config(page_title="EcoDrain-MAP Ghana", layout="wide", initial_sidebar_state="expanded")
 
 BOUNDS_CONFIG = {
@@ -264,34 +266,60 @@ def fetch_real_elevation_and_slope(lats, lons, dataset="srtm90m", offset_deg=0.0
 # ----------------------------------------------------------------------------
 
 def init_earth_engine():
-    """Attempts to authenticate Earth Engine from Streamlit secrets. Returns
-    True only if it actually succeeds — never assumes success."""
+    """
+    Initializes Google Earth Engine.
+
+    Supports:
+    - Local development using a JSON file path.
+    - Streamlit Community Cloud using Secrets.
+    """
     if not GEE_AVAILABLE:
         return False
-    if st.session_state.get("_gee_initialized"):
-        return True
+
     try:
-        sa_path = None
-        project = None
-        try:
-            sa_path = st.secrets.get("gee_service_account_path")
-            project = st.secrets.get("gee_project")
-        except Exception:
-            pass
-        sa_path = sa_path or os.environ.get("GEE_SERVICE_ACCOUNT_JSON")
-        project = project or os.environ.get("GEE_PROJECT")
+        project = st.secrets["gee_project"]
 
-        if not sa_path or not project:
-            return False
+        # ---------- Streamlit Cloud ----------
+        if "gee_service_account" in st.secrets:
+            service_account = json.loads(st.secrets["gee_service_account"])
 
-        credentials = ee.ServiceAccountCredentials(None, sa_path)
+            # Write JSON to a temporary file
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                json.dump(service_account, f)
+                key_path = f.name
+
+            credentials = ee.ServiceAccountCredentials(
+                service_account["client_email"],
+                key_path
+            )
+
+        # ---------- Local Computer ----------
+        elif "gee_service_account_path" in st.secrets:
+
+            key_path = st.secrets["gee_service_account_path"]
+
+            if not os.path.exists(key_path):
+                raise FileNotFoundError(
+                    f"Service account key not found:\n{key_path}"
+                )
+
+            credentials = ee.ServiceAccountCredentials(
+                None,
+                key_path
+            )
+
+        else:
+            raise RuntimeError(
+                "No Earth Engine credentials found in Streamlit Secrets."
+            )
+
         ee.Initialize(credentials, project=project)
-        st.session_state["_gee_initialized"] = True
+
         return True
+
     except Exception as e:
         st.session_state["_gee_init_error"] = str(e)
         return False
-
 
 def gee_ready():
     return bool(st.session_state.get("_gee_initialized"))
