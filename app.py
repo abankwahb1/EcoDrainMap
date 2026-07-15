@@ -1,7 +1,7 @@
-# EcoDrain-MAP Ghana — v3: Real Terrain Data Edition
+# EcoDrain-MAP Ghana — v4: Real Terrain Data + Machine Learning Edition
 #
 # Requirements:
-#   pip install streamlit pandas numpy requests folium streamlit-folium openpyxl
+#   pip install streamlit pandas numpy requests folium streamlit-folium openpyxl scikit-learn
 # Optional (for real Sentinel-2 impervious surface data):
 #   pip install earthengine-api
 #
@@ -42,6 +42,18 @@
 #      f. Re-run the app. The sidebar will show "Earth Engine: configured"
 #         once it can authenticate.
 #
+# 4. MACHINE LEARNING MODEL — new in v4.
+#    A Random Forest is trained once per app session (cached via
+#    @st.cache_resource, so it does NOT retrain on every slider move) on
+#    real terrain features sampled across all 18 zones, using the existing
+#    rule-based formula below as its training target. This is a surrogate
+#    model: it learns to reproduce and generalize the formula's output
+#    across new points, not an independently-verified flood-outcome model.
+#    Say this plainly if asked in your project defense — it's a legitimate,
+#    established technique (surrogate modeling for data-scarce risk mapping),
+#    not a shortcut, but it should be described accurately.
+#    See ml_model.py for the training/prediction logic.
+#
 # ============================================================================
 
 import io
@@ -55,6 +67,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
+
+import ml_model
 
 try:
     import ee
@@ -127,7 +141,7 @@ def fetch_real_osm_drainage_data(lat_min, lat_max, lon_min, lon_max):
 def lookup_street_identity(lat, lon):
     url = "https://nominatim.openstreetmap.org/reverse"
     params = {"lat": lat, "lon": lon, "format": "json", "zoom": 18, "addressdetails": 1}
-    headers = {"User-Agent": "EcoDrainMapGhanaFinalYearProject/3.0 (student.project@university.edu.gh)"}
+    headers = {"User-Agent": "EcoDrainMapGhanaFinalYearProject/4.0 (student.project@university.edu.gh)"}
     try:
         response = requests.get(url, params=params, headers=headers, timeout=6)
         response.raise_for_status()
@@ -316,11 +330,51 @@ def fetch_impervious_fraction_gee_batch(_cache_key, lat_lon_pairs):
 
 
 # ----------------------------------------------------------------------------
-# MODEL LAYER
+# MACHINE LEARNING MODEL — trained once per session, cached
+# ----------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_trained_model(use_gee_impervious: bool):
+    """
+    Trains a Random Forest once per Streamlit session (NOT on every rerun —
+    st.cache_resource ensures widget interactions reuse this cached model
+    instead of retraining). Samples real terrain data across all zones and
+    uses the app's own rule-based formula (mirrored in ml_model.py) as the
+    training target. Returns (model, metrics, importances, gee_stats) or
+    (None, None, None, None) if too little real data came back this session.
+
+    use_gee_impervious is part of the function signature (not just used
+    inside the body) specifically so that toggling GEE on/off in the sidebar
+    invalidates the cache and retrains with the new data source, instead of
+    silently reusing a model trained under the old setting.
+    """
+    progress_bar = st.progress(0, text="Training ML model — sampling real terrain data across Accra...")
+
+    def progress_cb(zi, total, zone_name):
+        progress_bar.progress((zi + 1) / total, text=f"Training on {zone_name}... ({zi + 1}/{total})")
+
+    training_df, gee_stats = ml_model.build_training_dataset(
+        BOUNDS_CONFIG, fetch_real_osm_drainage_data, fetch_real_elevation_and_slope,
+        points_per_zone=10, progress_callback=progress_cb,
+        fetch_impervious_fn=fetch_impervious_fraction_gee_batch if use_gee_impervious else None,
+        gee_ready_fn=gee_ready if use_gee_impervious else None,
+    )
+    progress_bar.empty()
+
+    if len(training_df) < 20:
+        return None, None, None, None  # not enough real data returned this session
+
+    model, metrics, importances = ml_model.train_flood_risk_model(training_df)
+    return model, metrics, importances, gee_stats
+
+
+# ----------------------------------------------------------------------------
+# MODEL LAYER (rule-based formula, with optional ML override)
 # ----------------------------------------------------------------------------
 
 def run_live_hydrological_model(bounds, rain_mm, soil_sat, grid_size=45,
-                                 use_real_elevation=True, use_real_impervious=False):
+                                 use_real_elevation=True, use_real_impervious=False,
+                                 use_ml_model=False, ml_flood_model=None):
     np.random.seed(42)
     lat_min, lat_max = bounds["lat_range"]
     lon_min, lon_max = bounds["lon_range"]
@@ -362,35 +416,21 @@ def run_live_hydrological_model(bounds, rain_mm, soil_sat, grid_size=45,
         "impervious_fraction": concrete_density, "dist_to_drain": computed_distances,
     })
 
-    # --- RECALIBRATED SCORING ---
+    # --- RULE-BASED SCORING (also used as the ML model's training target) ---
     # Each factor is normalized to 0-1 BEFORE combining, so real-world values
     # (which can fall well outside the old synthetic ranges) no longer blow up
-    # the score. The previous formula multiplied raw, unbounded numbers
-    # together and relied on a blanket .clip(0.01, 0.99) to mask the result,
-    # which caused every zone to saturate near 99% once real elevation/slope
-    # data was introduced.
+    # the score.
 
-    # 1. Rainfall factor: how much rain relative to a heavy-rain ceiling of 120mm
     rain_factor = np.clip(rain_mm / 120.0, 0, 1)
 
-    # 2. Elevation factor: RELATIVE to this zone's own sampled terrain, not a
-    #    fixed global cutoff. Lowest point in the zone = highest relative risk
-    #    (1.0), highest point in the zone = lowest relative risk (0.0).
     elev_min, elev_max = df["elevation"].min(), df["elevation"].max()
     elev_range = max(elev_max - elev_min, 1.0)  # avoid divide-by-zero on flat zones
     elevation_factor = (elev_max - df["elevation"]) / elev_range
 
-    # 3. Slope factor: flatter ground drains worse. Normalize against a 20% slope ceiling.
     slope_factor = 1.0 - np.clip(df["slope"] / 20.0, 0, 1)
-
-    # 4. Drainage distance factor: normalize against a 300m "far from any drain" ceiling
     drainage_factor = np.clip(df["dist_to_drain"] / 300.0, 0, 1)
-
-    # 5. Impervious surface factor: already 0-1, used directly
     impervious_factor = df["impervious_fraction"]
 
-    # Weighted combination - all components are now 0-1, so the sum is
-    # bounded and interpretable instead of being an arbitrary large number.
     base_score = (
         rain_factor * 0.30
         + impervious_factor * 0.25
@@ -399,11 +439,23 @@ def run_live_hydrological_model(bounds, rain_mm, soil_sat, grid_size=45,
         + drainage_factor * 0.10
     )
 
-    # Soil saturation moderately amplifies risk (up to +30% at fully
-    # saturated soil), instead of the old uncapped 1.0-2.0x multiplier.
     soil_multiplier = 1.0 + (soil_sat / 100.0) * 0.3
 
     df["flood_probability"] = np.clip(base_score * soil_multiplier, 0.02, 0.97)
+    df["risk_source"] = "Rule-based formula"
+
+    # --- OPTIONAL ML OVERRIDE ---
+    # Replaces the formula output with the trained Random Forest's prediction
+    # for the same points. The model was trained to reproduce this formula
+    # across real terrain data, so treat it as a smoothed/generalized version
+    # of the formula, not an independent ground truth.
+    if use_ml_model and ml_flood_model is not None:
+        df["flood_probability"] = ml_model.predict_risk(
+            ml_flood_model,
+            df["elevation"], df["slope"], df["impervious_fraction"],
+            df["dist_to_drain"], rain_mm, soil_sat,
+        )
+        df["risk_source"] = "ML model (Random Forest)"
 
     return df, osm_drains, is_live_drain, elev_is_real, impervious_is_real
 
@@ -538,6 +590,32 @@ if use_real_impervious and not gee_status:
     st.sidebar.warning("Earth Engine not configured — this run will use synthetic impervious surface data.")
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 Prediction Method")
+
+use_gee_for_training = use_real_impervious and gee_status
+
+with st.spinner("Preparing ML model (trains once per session)..."):
+    ml_flood_model, ml_metrics, ml_importances, ml_gee_stats = get_trained_model(use_gee_for_training)
+
+use_ml_model = st.sidebar.checkbox(
+    "Use ML model (Random Forest) instead of formula",
+    value=False,
+    disabled=(ml_flood_model is None),
+    help="Trained once per session on real terrain data, using the rule-based formula as its training target.",
+)
+if ml_flood_model is None:
+    st.sidebar.caption("⚠️ ML model unavailable this session (insufficient real data returned — check your network connection).")
+elif use_ml_model:
+    st.sidebar.caption(f"Model R²: {ml_metrics['r2']} | trained on {ml_metrics['n_train']} points")
+    if ml_gee_stats and ml_gee_stats["attempted"]:
+        st.sidebar.caption(
+            f"🌍 Sentinel-2 (GEE) used for {ml_gee_stats['zones_with_real_gee_data']}/"
+            f"{ml_gee_stats['total_zones_trained']} zones during training"
+        )
+    elif use_real_impervious and not gee_status:
+        st.sidebar.caption("🟡 Trained with synthetic impervious data (GEE not configured this session)")
+
+st.sidebar.markdown("---")
 high_risk_alert_threshold = st.sidebar.number_input("Alert threshold (critical nodes)", min_value=1, value=3, step=1)
 
 # ----------------------------------------------------------------------------
@@ -552,10 +630,11 @@ with tab_zone:
         processed_df, real_drains, is_live, elev_real, imp_real = run_live_hydrological_model(
             selected_bounds, rain_input, soil_wetness,
             use_real_elevation=use_real_elevation, use_real_impervious=use_real_impervious,
+            use_ml_model=use_ml_model, ml_flood_model=ml_flood_model,
         )
     plan_df = build_action_plan_df(processed_df)
 
-    st.caption(f"Data quality: {quality_caption(is_live, elev_real, imp_real)}")
+    st.caption(f"Data quality: {quality_caption(is_live, elev_real, imp_real)} | Risk source: {plan_df['risk_source'].iloc[0]}")
 
     high_risk_count = int((plan_df["severity"] == "CRITICAL").sum())
     med_risk_count = int((plan_df["severity"] == "MODERATE").sum())
@@ -624,10 +703,30 @@ with tab_zone:
                 street_name = lookup_street_identity(target_row["latitude"], target_row["longitude"])
             st.info(f"**Location Registry Identity:**\n\n{street_name}")
 
+    if ml_flood_model is not None:
+        with st.expander("🤖 ML Model Diagnostics"):
+            st.caption(
+                "This Random Forest is trained to reproduce the rule-based formula across real terrain "
+                "data — it's a surrogate model for smoothing/generalizing the formula, not an "
+                "independently-verified flood-outcome predictor."
+            )
+            st.write(f"**R² score:** {ml_metrics['r2']}  |  **RMSE:** {ml_metrics['rmse']}")
+            st.write(f"Trained on {ml_metrics['n_train']} points, tested on {ml_metrics['n_test']}")
+            if ml_gee_stats and ml_gee_stats["attempted"]:
+                st.write(
+                    f"**Impervious surface source:** real Sentinel-2 via Earth Engine for "
+                    f"{ml_gee_stats['zones_with_real_gee_data']}/{ml_gee_stats['total_zones_trained']} zones "
+                    f"(remaining zones used synthetic fallback if GEE calls failed for that zone)"
+                )
+            else:
+                st.write("**Impervious surface source:** synthetic (GEE not enabled for this training run)")
+            st.markdown("**Feature importance:**")
+            st.bar_chart(ml_importances)
+
     st.markdown("---")
     st.subheader("📋 Prioritized Action Plan")
     display_cols = ["latitude", "longitude", "elevation", "slope", "impervious_fraction",
-                     "flood_probability", "severity", "directive", "resources",
+                     "flood_probability", "risk_source", "severity", "directive", "resources",
                      "est_cost_ghs", "response_window_hrs", "priority"]
     action_table = plan_df[display_cols].sort_values(["priority", "flood_probability"], ascending=[True, False])
     st.dataframe(action_table, use_container_width=True, height=300)
@@ -657,6 +756,7 @@ with tab_scan:
                 df_zone, _, is_live_zone, elev_real_zone, imp_real_zone = run_live_hydrological_model(
                     bounds, rain_input, soil_wetness, grid_size=20,
                     use_real_elevation=use_real_elevation, use_real_impervious=use_real_impervious,
+                    use_ml_model=use_ml_model, ml_flood_model=ml_flood_model,
                 )
                 plan_zone = build_action_plan_df(df_zone)
                 scan_rows.append({
@@ -666,6 +766,7 @@ with tab_scan:
                     "mean_flood_probability": plan_zone["flood_probability"].mean(),
                     "max_flood_probability": plan_zone["flood_probability"].max(),
                     "est_total_cost_ghs": int(plan_zone["est_cost_ghs"].sum()),
+                    "risk_source": plan_zone["risk_source"].iloc[0],
                     "live_drainage_data": is_live_zone,
                     "real_elevation_data": elev_real_zone,
                     "real_impervious_data": imp_real_zone,
@@ -692,7 +793,8 @@ with tab_scan:
         imp_count = int(scan_df["real_impervious_data"].sum())
         st.caption(
             f"Data quality across scan: {elev_count}/{len(scan_df)} zones used real elevation/slope, "
-            f"{imp_count}/{len(scan_df)} zones used real Sentinel-2 impervious data."
+            f"{imp_count}/{len(scan_df)} zones used real Sentinel-2 impervious data. "
+            f"Risk source: {scan_df['risk_source'].iloc[0]}."
         )
 
         st.markdown("**Export the full city-wide scan:**")
