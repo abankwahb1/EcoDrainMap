@@ -41,7 +41,7 @@ The application provides an interactive interface for simulating rainfall events
 Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ecodrainmap.git
+git clone https://github.com/abankwahb1/ecodrainmap.git
 cd ecodrainmap
 ```
 
